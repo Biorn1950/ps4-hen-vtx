@@ -1,167 +1,219 @@
-#include <stddef.h>
-#include <stdint.h>
+#include <assert.h>
 
-#include "sections.h"
-#include "sparse.h"
-#include "freebsd_helper.h"
-#include "elf_helper.h"
-#include "self_helper.h"
-#include "sbl_helper.h"
-#include "pfs_helper.h"
-#include "rif_helper.h"
-#include "ccp_helper.h"
+#include "ps4.h"
+#include "defines.h"
+#include "debug.h"
 
-void* (*real_malloc)(unsigned long size, void* type, int flags) PAYLOAD_BSS;
-void (*real_free)(void* addr, void* type) PAYLOAD_BSS;
-void* (*real_memcpy)(void* dst, const void* src, size_t len) PAYLOAD_BSS;
-void* (*real_memcmp)(const void *b1, const void *b2, size_t len) PAYLOAD_BSS;
-void* (*real_memset)(void *s, int c, size_t n) PAYLOAD_BSS;
-int (*real_sx_xlock)(struct sx *sx, int opts) PAYLOAD_BSS;
-int (*real_sx_xunlock)(struct sx *sx) PAYLOAD_BSS;
-int (*real_fpu_kern_enter)(struct thread *td, struct fpu_kern_ctx *ctx, uint32_t flags) PAYLOAD_BSS;
-int (*real_fpu_kern_leave)(struct thread *td, struct fpu_kern_ctx *ctx) PAYLOAD_BSS;
-void (*real_Sha256Hmac)(uint8_t hash[0x20], const uint8_t* data, size_t data_size, const uint8_t* key, int key_size) PAYLOAD_BSS;
-int (*real_AesCbcCfb128Decrypt)(uint8_t* out, const uint8_t* in, size_t data_size, const uint8_t* key, int key_size, uint8_t* iv) PAYLOAD_BSS;
-int (*real_RsaesPkcs1v15Dec2048CRT)(struct rsa_buffer* out, struct rsa_buffer* in, struct rsa_key* key) PAYLOAD_BSS;
-void* (*real_eventhandler_register)(void* list, const char* name, void* func, void* arg, int priority) PAYLOAD_BSS;
-void  (*real_sx_init_flags)(struct sx *sx, const char *description, int opts) PAYLOAD_BSS;
-void  (*real_sx_destroy)(struct sx *sx) PAYLOAD_BSS;
-void (*real_sceSblAuthMgrSmStart)(void**) PAYLOAD_BSS;
-int (*real_sceSblServiceMailbox)(unsigned long service_id, uint8_t request[SBL_MSG_SERVICE_MAILBOX_MAX_SIZE], void* response) PAYLOAD_BSS;
-int (*real_sceSblAuthMgrGetSelfInfo)(struct self_context* ctx, struct self_ex_info** info) PAYLOAD_BSS;
-int (*real_sceSblAuthMgrIsLoadable2)(struct self_context* ctx, struct self_auth_info* old_auth_info, int path_id, struct self_auth_info* new_auth_info) PAYLOAD_BSS;
-int (*real_sceSblAuthMgrVerifyHeader)(struct self_context* ctx) PAYLOAD_BSS;
-int (*real_sceSblPfsKeymgrGenEKpfsForGDGPAC)(struct pfs_key_blob* key_blob) PAYLOAD_BSS;
-int (*real_sceSblPfsSetKey)(uint32_t* ekh, uint32_t* skh, uint8_t* key, uint8_t* iv, int type, int unused, uint8_t is_disc) PAYLOAD_BSS;
-int (*real_sceSblServiceCryptAsync)(struct ccp_req* request) PAYLOAD_BSS;
-int (*real_sceSblKeymgrSmCallfunc)(union keymgr_payload* payload) PAYLOAD_BSS;
-
-void* M_TEMP PAYLOAD_BSS;
-void* fpu_ctx PAYLOAD_BSS;
-uint8_t* mini_syscore_self_binary PAYLOAD_BSS;
-struct sbl_map_list_entry** sbl_driver_mapped_pages PAYLOAD_BSS;
-struct sbl_key_rbtree_entry** sbl_keymgr_key_rbtree PAYLOAD_BSS;
-
-extern int my_sceSblAuthMgrIsLoadable2(struct self_context* ctx, struct self_auth_info* old_auth_info, int path_id, struct self_auth_info* new_auth_info) PAYLOAD_CODE;
-extern int my_sceSblAuthMgrVerifyHeader(struct self_context* ctx) PAYLOAD_CODE;
-extern int my_sceSblAuthMgrSmLoadSelfSegment__sceSblServiceMailbox(unsigned long service_id, uint8_t* request, void* response) PAYLOAD_CODE;
-extern int my_sceSblAuthMgrSmLoadSelfBlock__sceSblServiceMailbox(unsigned long service_id, uint8_t* request, void* response) PAYLOAD_CODE;
-extern int my_sceSblKeymgrSmCallfunc_npdrm_decrypt_isolated_rif(union keymgr_payload* payload) PAYLOAD_CODE;
-extern int my_sceSblPfsKeymgrGenEKpfsForGDGPAC_sceSblPfsKeymgrIoctl(struct pfs_key_blob* key_blob) PAYLOAD_CODE;
-extern int my_sceSblPfsSetKey_pfs_sbl_init(uint32_t* ekh, uint32_t* skh, uint8_t* key, uint8_t* iv, int type, int unused, uint8_t is_disc) PAYLOAD_CODE;
-extern int my_sceSblServiceCryptAsync_pfs_crypto(struct ccp_req* request) PAYLOAD_CODE;
-extern int my_sceSblKeymgrSmCallfunc_npdrm_decrypt_rif_new(union keymgr_payload* payload) PAYLOAD_CODE;
-
-extern struct fake_key_desc s_fake_keys[MAX_FAKE_KEYS] PAYLOAD_BSS;
-extern struct sx s_fake_keys_lock PAYLOAD_BSS;
-
-struct real_info
+int find_process(const char* target)
 {
-  const size_t kernel_offset;
-  const void* payload_target;
-};
+  int pid;
+  int mib[3] = {1, 14, 0};
+  size_t size, count;
+  char* data;
+  char* proc;
 
-struct disp_info
-{
-  const size_t call_offset;
-  const void* payload_target;
-};
+  if (sysctl(mib, 3, NULL, &size, NULL, 0) < 0)
+  {
+    return -1;
+  }
 
-struct real_info real_infos[] PAYLOAD_DATA =
-{
-  { 0x3F7750, &real_malloc },
-  { 0x3F7930, &real_free },
-  { 0x14A6B0, &real_memcpy },
-  { 0x242A60, &real_memcmp },
-  { 0x302BD0, &real_memset },
-  { 0x38FA30, &real_sx_xlock },
-  { 0x38FBC0, &real_sx_xunlock },
-  { 0x059580, &real_fpu_kern_enter },
-  { 0x059680, &real_fpu_kern_leave },
-  { 0x2D5C50, &real_Sha256Hmac },
-  { 0x17A6F0, &real_AesCbcCfb128Decrypt },
-  { 0x3EF200, &real_RsaesPkcs1v15Dec2048CRT },
-  { 0x3C97F0, &real_eventhandler_register },
-  { 0x38F900, &real_sx_init_flags },
-  { 0x38F970, &real_sx_destroy },
-  { 0x622020, &real_sceSblAuthMgrSmStart },
-  { 0x60CA10, &real_sceSblServiceCryptAsync },
-  { 0x6146C0, &real_sceSblServiceMailbox },
-  { 0x606E00, &real_sceSblPfsSetKey },
-  { 0x60E680, &real_sceSblKeymgrSmCallfunc },
-  { 0x625C50, &real_sceSblAuthMgrIsLoadable2 },
-  { 0x625CB0, &real_sceSblAuthMgrVerifyHeader },
-  { 0x626490, &real_sceSblAuthMgrGetSelfInfo },
-  { 0x60F000, &real_sceSblPfsKeymgrGenEKpfsForGDGPAC },
+  if (size == 0)
+  {
+    return -2;
+  }
 
-  { 0x1993B30, &M_TEMP },
-  { 0x251CCC0, &fpu_ctx },
-  { 0x1471468, &mini_syscore_self_binary },
-  { 0x2519DD0, &sbl_driver_mapped_pages },
-  { 0x2534DE0, &sbl_keymgr_key_rbtree },
+  data = (char*)malloc(size);
+  if (data == NULL)
+  {
+    return -3;
+  }
 
-  { 0, NULL },
-};
+  if (sysctl(mib, 3, data, &size, NULL, 0) < 0)
+  {
+    free(data);
+    return -4;
+  }
 
-struct disp_info disp_infos[] PAYLOAD_DATA =
-{
-  // Fself
-  { 0x61F24F, &my_sceSblAuthMgrIsLoadable2 },
-  { 0x61F976, &my_sceSblAuthMgrVerifyHeader },
-  { 0x620599, &my_sceSblAuthMgrVerifyHeader },
-  { 0x6238BA, &my_sceSblAuthMgrSmLoadSelfSegment__sceSblServiceMailbox },
-  { 0x6244E1, &my_sceSblAuthMgrSmLoadSelfBlock__sceSblServiceMailbox },
+  count = size / 0x448;
+  proc = data;
+  pid = -1;
+  while (count != 0)
+  {
+    char* name = &proc[0x1BF];
+    if (strncmp(name, target, strlen(target)) == 0)
+    {
+      pid = *(int*)(&proc[0x48]);
+      break;
+    }
+    proc += 0x448;
+    count--;
+  }
 
-  // Fpkg 
-  { 0x62DF00, &my_sceSblKeymgrSmCallfunc_npdrm_decrypt_isolated_rif },
-  { 0x62ECDE, &my_sceSblKeymgrSmCallfunc_npdrm_decrypt_rif_new },
-  { 0x607045, &my_sceSblPfsKeymgrGenEKpfsForGDGPAC_sceSblPfsKeymgrIoctl  },
-  { 0x6070E1, &my_sceSblPfsKeymgrGenEKpfsForGDGPAC_sceSblPfsKeymgrIoctl },
-  { 0x69DB4A, &my_sceSblPfsSetKey_pfs_sbl_init },
-  { 0x69DBD8, &my_sceSblPfsSetKey_pfs_sbl_init },
-  { 0x69DDE4, &my_sceSblServiceCryptAsync_pfs_crypto },
-  { 0x69E28C, &my_sceSblServiceCryptAsync_pfs_crypto },
-  { 0x69E4E8, &my_sceSblServiceCryptAsync_pfs_crypto },
-  { 0x69E85D, &my_sceSblServiceCryptAsync_pfs_crypto },
-  { 0x69EC7E, &my_sceSblServiceCryptAsync_pfs_crypto },
-  { 0x69EF0D, &my_sceSblServiceCryptAsync_pfs_crypto },
-  { 0x69F252, &my_sceSblServiceCryptAsync_pfs_crypto },
-
-  { 0, 0 },
-};
-
-struct fake_key_desc s_fake_keys[MAX_FAKE_KEYS] PAYLOAD_BSS;
-struct sx s_fake_keys_lock PAYLOAD_BSS;
-
-PAYLOAD_CODE void debug_pfs_cleanup(void* arg)
-{
-  real_sx_destroy(&s_fake_keys_lock);
+  free(data);
+  return pid;
 }
 
-// initialization, etc
-
-PAYLOAD_CODE void my_entrypoint()
+int get_code_info(int pid, uint64_t* paddress, uint64_t* psize, uint64_t known_size)
 {
-  real_sx_init_flags(&s_fake_keys_lock, "fake_keys_lock", 0);
-  real_eventhandler_register(NULL, "shutdown_pre_sync", &debug_pfs_cleanup, NULL, 0);
+  int mib[4] = {1, 14, 32, pid};
+  size_t size, count;
+  char* data;
+  char* entry;
+
+  if (sysctl(mib, 4, NULL, &size, NULL, 0) < 0)
+  {
+    return -1;
+  }
+
+  if (size == 0)
+  {
+    return -2;
+  }
+
+  data = (char*)malloc(size);
+  if (data == NULL)
+  {
+    return -3;
+  }
+
+  if (sysctl(mib, 4, data, &size, NULL, 0) < 0)
+  {
+    free(data);
+    return -4;
+  }
+
+  int struct_size = *(int*)data;
+  count = size / struct_size;
+  entry = data;
+
+  int found = 0;
+  while (count != 0)
+  {
+    int type = *(int*)(&entry[0x4]);
+    uint64_t start_addr = *(uint64_t*)(&entry[0x8]);
+    uint64_t end_addr = *(uint64_t*)(&entry[0x10]);
+    uint64_t code_size = end_addr - start_addr;
+    uint32_t prot = *(uint32_t*)(&entry[0x38]);
+
+    printfsocket("%d 0x%llx 0x%llx (0x%llx) %x\n", type, start_addr, end_addr, code_size, prot);
+
+    if (type == 255 && prot == 5 && code_size == known_size)
+    {
+      *paddress = start_addr;
+      *psize = (end_addr - start_addr);
+      found = 1;
+      break;
+    }
+
+    entry += struct_size;
+    count--;
+  }
+
+  free(data);
+  return !found ? -5 : 0;
 }
 
-struct
+typedef struct _patch_info
 {
-  uint64_t signature;
-  struct real_info* real_infos;
-  struct disp_info* disp_infos;
-  void* entrypoint;
+  const char* name;
+  uint32_t address;
+  const char* data;
+  uint32_t size;
 }
-payload_header PAYLOAD_HEADER =
-{
-  0x5041594C4F414430ull,
-  real_infos,
-  disp_infos,
-  &my_entrypoint,
-};
+patch_info;
 
-int _start()
+int apply_patches(int pid, uint64_t known_size, const patch_info* patches)
 {
+  uint64_t code_address, code_size;
+  int result = get_code_info(pid, &code_address, &code_size, known_size);
+  if (result < 0)
+  {
+    printfsocket("Failed to get code info for %d: %d\n", pid, result);
+    return -1;
+  }
+
+  char proc_path[64];
+  sprintf(proc_path, "/mnt/proc/%d/mem", pid);
+
+  int fd = open(proc_path, O_RDWR, 0);
+  if (fd < 0)
+  {
+    printfsocket("Failed to open %s!\n", proc_path);
+    return -2;
+  }
+
+  printfsocket("Opened process memory...\n");
+  for (int i = 0; patches[i].data != NULL; i++)
+  {
+    lseek(fd, code_address + patches[i].address, SEEK_SET);
+    result = write(fd, patches[i].data, patches[i].size);
+    printfsocket("patch %s: %d %d\n", patches[i].name, result, result < 0 ? errno : 0);
+  }
+
+  close(fd);
+  return (result < 0 ? errno : 0);
+}
+
+int mount_procfs()
+{
+  int result = mkdir("/mnt/proc", 0777);
+  if (result < 0 && (*__error()) != 17)
+  {
+    printfsocket("Failed to create /mnt/proc\n");
+    return -1;
+  }
+
+  result = mount("procfs", "/mnt/proc", 0, NULL);
+  if (result < 0)
+  {
+    printfsocket("Failed to mount procfs: %d\n", result, *__error());
+    return -2;
+  }
+
   return 0;
+}
+
+int do_patch()
+{
+  const patch_info shellcore_patches[] =
+  {
+    // call sceKernelIsGenuineCEX
+    { NULL, 0x1486BB, "\x31\xC0\x90\x90\x90", 5 },
+    { NULL, 0x6E523B, "\x31\xC0\x90\x90\x90", 5 },
+    { NULL, 0x852C6B, "\x31\xC0\x90\x90\x90", 5 },
+             
+    // call nidf_libSceDipsw_0xD21CE9E2F639A83C
+    { NULL, 0x1486E7, "\x31\xC0\x90\x90\x90", 5 },
+    { NULL, 0x6E5267, "\x31\xC0\x90\x90\x90", 5 },
+    { NULL, 0x852C97, "\x31\xC0\x90\x90\x90", 5 },
+
+    // debug pkg free string
+    { NULL, 0xD40F28, "free\0", 5 },
+
+    // disable screenshot patch
+    { NULL, 0xB4B0B, "\x90\x90\x90\x90\x90", 5 },
+
+    { NULL, 0, NULL, 0 },
+  };
+
+  int result;
+
+  int shell_pid = find_process("SceShellCore");
+  if (shell_pid < 0)
+  {
+    printfsocket("Failed to find SceShellCore: %d\n", shell_pid);
+    return -1;
+  }
+  printfsocket("Found SceShellCore at pid %d!\n", shell_pid);
+
+  result = mount_procfs();
+  if (result)
+  {
+    return -2;
+  }
+
+  printfsocket("Patching SceShellCore...\n");
+  result = apply_patches(shell_pid, 0xFEC000, shellcore_patches);
+
+  return result;
 }
